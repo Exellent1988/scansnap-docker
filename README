@@ -1,0 +1,60 @@
+SCANSNAP
+
+          A simple command-line tool that talks to Fujitsu ScanSnap
+     iX500 scanners over WiFi. Put paper in, run the command, get a
+     PDF. No daemon, no GUI, no dependencies beyond libc and pthreads.
+
+          May also work with other ScanSnap models that use WiFi
+     (iX1500, etc.) — reports welcome.
+
+
+BUILD
+
+          make
+
+
+SETUP (one time)
+
+          Your scanner is paired with a key — the serial number of
+     its internal WiFi module. If the scanner was set up with the
+     official ScanSnap Home app, that app knows the key, so we
+     trick it into telling us:
+
+     1. Turn off or disconnect the real scanner
+     2. Run "scansnap --getkey" (needs ports 52217, 53218, 53219 —
+        may need sudo)
+     3. Open ScanSnap Home on your Mac or Windows machine — it will
+        find the fake scanner and send the key
+     The key is saved to ~/.config/scansnap/key automatically.
+     You only need to do this once.
+
+
+SCAN
+
+          scansnap
+
+          The scanner is found automatically on your local network.
+     Pages come out as a timestamped PDF in the current directory.
+
+
+OPTIONS
+
+     -s IP       scanner IP (skip auto-discovery)
+     -k KEY      pairing key from setup step
+     -o FILE     output filename (default: scan_YYYYMMDD_HHMM.pdf)
+     -j          save as separate JPEG files instead of PDF
+     -1          single-sided (discard back pages)
+     -d          debug output
+     --getkey    capture pairing key (see setup)
+
+
+HOW IT WORKS
+
+          The scanner speaks a proprietary protocol ("VENS") over
+     UDP and TCP. See the PROTOCOL file for the full reverse-
+     engineered specification.
+
+
+LICENSE
+
+          GPL-2.0 — see LICENSE file
