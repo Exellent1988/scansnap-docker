@@ -51,6 +51,7 @@
 static bool g_debug = false;
 static volatile sig_atomic_t g_interrupted = 0;
 static uint32_t g_scanner_ip = 0;
+static uint32_t g_bind_ip = 0;
 static uint8_t  g_mac[6] = {0};
 static const char *g_pairing_key = NULL;
 static char g_key_buf[64];
@@ -115,6 +116,16 @@ static int hex_decode(const char *hex, uint8_t *out, size_t max) {
         out[i / 2] = (uint8_t)byte;
     }
     return (int)(len / 2);
+}
+
+static int parse_mac_address(const char *mac_str, uint8_t mac[6]) {
+    unsigned int m[6];
+    if (!mac_str) return -1;
+    if (sscanf(mac_str, "%x:%x:%x:%x:%x:%x",
+               &m[0], &m[1], &m[2], &m[3], &m[4], &m[5]) != 6)
+        return -1;
+    for (int i = 0; i < 6; i++) mac[i] = (uint8_t)m[i];
+    return 0;
 }
 
 static void put_be32(uint8_t *p, uint32_t v) {
@@ -199,6 +210,7 @@ static int bind_udp(uint16_t port) {
     int opt = 1;
     setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
     struct sockaddr_in addr = { .sin_family = AF_INET, .sin_port = htons(port) };
+    if (g_bind_ip != 0) addr.sin_addr.s_addr = g_bind_ip;
     if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) { close(fd); return -1; }
     return fd;
 }
@@ -206,6 +218,14 @@ static int bind_udp(uint16_t port) {
 static int connect_tcp_ms(uint32_t ip, uint16_t port, int timeout_ms) {
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) return -1;
+
+    if (g_bind_ip != 0) {
+        struct sockaddr_in local = { .sin_family = AF_INET, .sin_addr.s_addr = g_bind_ip };
+        if (bind(fd, (struct sockaddr *)&local, sizeof(local)) < 0) {
+            close(fd);
+            return -1;
+        }
+    }
 
     /* Non-blocking connect + poll for reliable timeout */
     int flags = fcntl(fd, F_GETFL);
@@ -344,17 +364,25 @@ static uint32_t discover(void) {
 
 /* ── Network detection ────────────────────────────────────────────────── */
 
-static int detect_network(uint32_t scanner_ip, uint8_t mac[6], uint32_t *local_ip) {
-    /* Get local IP via UDP connect trick */
-    int sock = socket(AF_INET, SOCK_DGRAM, 0);
-    if (sock < 0) return -1;
-    struct sockaddr_in dst = { .sin_family = AF_INET, .sin_port = htons(1), .sin_addr.s_addr = scanner_ip };
-    connect(sock, (struct sockaddr *)&dst, sizeof(dst));
-    struct sockaddr_in local;
-    socklen_t slen = sizeof(local);
-    getsockname(sock, (struct sockaddr *)&local, &slen);
-    close(sock);
-    *local_ip = local.sin_addr.s_addr;
+static int detect_network(uint32_t scanner_ip, uint8_t mac[6], uint32_t *local_ip,
+                          const char *forced_client_ip, const char *forced_client_mac) {
+    if (forced_client_ip && forced_client_ip[0]) {
+        if (inet_pton(AF_INET, forced_client_ip, local_ip) != 1) return -1;
+    } else {
+        /* Get local IP via UDP connect trick */
+        int sock = socket(AF_INET, SOCK_DGRAM, 0);
+        if (sock < 0) return -1;
+        struct sockaddr_in dst = { .sin_family = AF_INET, .sin_port = htons(1), .sin_addr.s_addr = scanner_ip };
+        connect(sock, (struct sockaddr *)&dst, sizeof(dst));
+        struct sockaddr_in local;
+        socklen_t slen = sizeof(local);
+        getsockname(sock, (struct sockaddr *)&local, &slen);
+        close(sock);
+        *local_ip = local.sin_addr.s_addr;
+    }
+
+    if (forced_client_mac && forced_client_mac[0])
+        return parse_mac_address(forced_client_mac, mac);
 
     /* Get interface name via `ip route get` */
     char ip_str[INET_ADDRSTRLEN];
@@ -974,14 +1002,11 @@ static int do_getkey(const char *advertise_ip, const char *device_name,
     uint8_t fake_mac[6] = {0x00, 0x80, 0x92, 0x58, 0xc1, 0x5c};
     uint8_t info_tail[8] = {0x36, 0xc7, 0xc7, 0xe4, 0x7a, 0x80, 0x00, 0x00};
     if (fake_mac_str && fake_mac_str[0]) {
-        unsigned int m[6];
-        if (sscanf(fake_mac_str, "%x:%x:%x:%x:%x:%x",
-                   &m[0], &m[1], &m[2], &m[3], &m[4], &m[5]) != 6) {
+        if (parse_mac_address(fake_mac_str, fake_mac) < 0) {
             fprintf(stderr, "Error: invalid --getkey-mac address: %s\n", fake_mac_str);
             close(bcast_fd);
             return -1;
         }
-        for (int i = 0; i < 6; i++) fake_mac[i] = (uint8_t)m[i];
     }
     if (info_tail_hex && info_tail_hex[0]) {
         if (parse_hex_exact(info_tail_hex, info_tail, sizeof(info_tail)) < 0) {
@@ -1218,7 +1243,11 @@ static void usage(void) {
         "  --getkey-mac MAC\n"
         "           fake scanner MAC (default: 00:80:92:58:c1:5c)\n"
         "  --getkey-tail HEX\n"
-        "           8-byte hex tail for UDP device info response\n");
+        "           8-byte hex tail for UDP device info response\n"
+        "  --client-ip IP\n"
+        "           override local client IP for scanner communication\n"
+        "  --client-mac MAC\n"
+        "           override client MAC for scanner communication\n");
 }
 
 int main(int argc, char *argv[]) {
@@ -1234,6 +1263,8 @@ int main(int argc, char *argv[]) {
     const char *getkey_model = NULL;
     const char *getkey_mac = NULL;
     const char *getkey_tail = NULL;
+    const char *client_ip = NULL;
+    const char *client_mac = NULL;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--getkey") == 0) {
             want_getkey = true;
@@ -1279,12 +1310,60 @@ int main(int argc, char *argv[]) {
             getkey_tail = argv[++i];
         } else if (strncmp(argv[i], "--getkey-tail=", 14) == 0) {
             getkey_tail = argv[i] + 14;
+        } else if (strcmp(argv[i], "--client-ip") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "Error: --client-ip requires an IP address\n");
+                return 1;
+            }
+            client_ip = argv[++i];
+        } else if (strncmp(argv[i], "--client-ip=", 12) == 0) {
+            client_ip = argv[i] + 12;
+        } else if (strcmp(argv[i], "--client-mac") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "Error: --client-mac requires a value\n");
+                return 1;
+            }
+            client_mac = argv[++i];
+        } else if (strncmp(argv[i], "--client-mac=", 13) == 0) {
+            client_mac = argv[i] + 13;
         }
     }
     if (want_getkey) {
         return do_getkey(getkey_ip, getkey_name, getkey_model,
                          getkey_mac, getkey_tail) < 0 ? 1 : 0;
     }
+
+    int filtered_argc = 1;
+    for (int i = 1; i < argc; i++) {
+        bool skip_current = false;
+        bool skip_next = false;
+        if (strcmp(argv[i], "--getkey") == 0) {
+            skip_current = true;
+        } else if (strcmp(argv[i], "--getkey-ip") == 0
+                   || strcmp(argv[i], "--getkey-name") == 0
+                   || strcmp(argv[i], "--getkey-model") == 0
+                   || strcmp(argv[i], "--getkey-mac") == 0
+                   || strcmp(argv[i], "--getkey-tail") == 0
+                   || strcmp(argv[i], "--client-ip") == 0
+                   || strcmp(argv[i], "--client-mac") == 0) {
+            skip_current = true;
+            skip_next = true;
+        } else if (strncmp(argv[i], "--getkey-ip=", 12) == 0
+                   || strncmp(argv[i], "--getkey-name=", 14) == 0
+                   || strncmp(argv[i], "--getkey-model=", 15) == 0
+                   || strncmp(argv[i], "--getkey-mac=", 13) == 0
+                   || strncmp(argv[i], "--getkey-tail=", 14) == 0
+                   || strncmp(argv[i], "--client-ip=", 12) == 0
+                   || strncmp(argv[i], "--client-mac=", 13) == 0) {
+            skip_current = true;
+        }
+
+        if (!skip_current)
+            argv[filtered_argc++] = argv[i];
+        if (skip_next) i++;
+    }
+    argc = filtered_argc;
+    argv[argc] = NULL;
 
     const char *scanner_str = NULL, *output = NULL, *key_str = NULL;
     bool jpeg_mode = false, simplex = false;
@@ -1325,7 +1404,7 @@ int main(int argc, char *argv[]) {
 
     uint8_t mac[6];
     uint32_t local_ip;
-    if (detect_network(scanner_ip, mac, &local_ip) < 0) {
+    if (detect_network(scanner_ip, mac, &local_ip, client_ip, client_mac) < 0) {
         fprintf(stderr, "Error: failed to detect network\n");
         return 1;
     }
@@ -1336,6 +1415,7 @@ int main(int argc, char *argv[]) {
     }
 
     g_scanner_ip = scanner_ip;
+    g_bind_ip = local_ip;
     memcpy(g_mac, mac, 6);
 
     if (do_register(scanner_ip, local_ip, mac) < 0
