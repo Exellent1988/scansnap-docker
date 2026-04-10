@@ -41,6 +41,53 @@ DOCKER
             scanner ports. That generally means `--network host`, or
             equivalent host-network support in your Docker runtime.
 
+DOCKER COMPOSE WORKFLOW
+
+          The compose setup is meant for a Linux host on the same LAN
+     as the scanner. It persists two directories in the repository:
+
+          - `./output` for scanned PDFs/JPEGs
+          - `./config` for the saved pairing key
+
+          Prepare the folders and build once:
+
+              mkdir -p output config
+              docker compose build
+
+          One-time pairing key bootstrap:
+
+          1. Turn off or disconnect the real scanner
+          2. Start the fake scanner:
+
+                 docker compose run --rm scansnap --getkey
+
+          3. Open ScanSnap Home on your Mac or Windows machine
+          4. Wait for the key to be printed and saved to:
+
+                 ./config/scansnap/key
+
+          Regular scans with the saved key:
+
+              docker compose run --rm scansnap -s SCANNER_IP
+
+          The PDF is written to `./output` because `/work` is bound to
+     that folder inside the container. If you already know the pairing
+     key, you can skip the bootstrap step and either put it in
+     `./config/scansnap/key` or pass `-k KEY` manually.
+
+          Important:
+
+          - The compose file uses `network_mode: host` because the
+            protocol setup needs the scanner to see the host IP and,
+            for `--getkey`, to reach ports 52217, 53218 and 53219.
+          - This is reliable on Linux. Docker Desktop on macOS/Windows
+            can still build the image, but runtime communication with
+            the physical scanner may fail because host networking is
+            not equivalent there.
+          - For custom output names, append normal CLI flags:
+
+                docker compose run --rm scansnap -s SCANNER_IP -o /work/my_scan.pdf
+
 
 SETUP (one time)
 

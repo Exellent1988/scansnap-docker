@@ -2,3 +2,5 @@ scansnap
 *.o
 *.pdf
 *.jpg
+config/
+output/
