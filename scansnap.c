@@ -21,6 +21,8 @@
  *               fake scanner model string (default: ScanSnap iX500)
  *   --getkey-mac MAC
  *               fake scanner MAC (default: 00:80:92:58:c1:5c)
+ *   --getkey-tail HEX
+ *               8-byte hex tail for UDP device info response
  */
 
 #include <arpa/inet.h>
@@ -916,8 +918,16 @@ static void copy_padded_ascii(uint8_t *dst, size_t dst_len, const char *src) {
     memcpy(dst, src, n);
 }
 
+static int parse_hex_exact(const char *hex, uint8_t *out, size_t len) {
+    if (!hex) return -1;
+    size_t hex_len = strlen(hex);
+    if (hex_len != len * 2) return -1;
+    return hex_decode(hex, out, len) == (int)len ? 0 : -1;
+}
+
 static int do_getkey(const char *advertise_ip, const char *device_name,
-                     const char *model_name, const char *fake_mac_str) {
+                     const char *model_name, const char *fake_mac_str,
+                     const char *info_tail_hex) {
     /* Broadcast discovery on UDP:53220 so ScanSnap Home finds us */
     int bcast_fd = socket(AF_INET, SOCK_DGRAM, 0);
     if (bcast_fd < 0) { perror("socket"); return -1; }
@@ -945,6 +955,7 @@ static int do_getkey(const char *advertise_ip, const char *device_name,
     }
     uint8_t *ip = (uint8_t *)&plocal.sin_addr.s_addr;
     uint8_t fake_mac[6] = {0x00, 0x80, 0x92, 0x58, 0xc1, 0x5c};
+    uint8_t info_tail[8] = {0x36, 0xc7, 0xc7, 0xe4, 0x7a, 0x80, 0x00, 0x00};
     if (fake_mac_str && fake_mac_str[0]) {
         unsigned int m[6];
         if (sscanf(fake_mac_str, "%x:%x:%x:%x:%x:%x",
@@ -954,6 +965,13 @@ static int do_getkey(const char *advertise_ip, const char *device_name,
             return -1;
         }
         for (int i = 0; i < 6; i++) fake_mac[i] = (uint8_t)m[i];
+    }
+    if (info_tail_hex && info_tail_hex[0]) {
+        if (parse_hex_exact(info_tail_hex, info_tail, sizeof(info_tail)) < 0) {
+            fprintf(stderr, "Error: invalid --getkey-tail value: %s\n", info_tail_hex);
+            close(bcast_fd);
+            return -1;
+        }
     }
     if (g_debug) {
         char ip_str[INET_ADDRSTRLEN];
@@ -966,6 +984,9 @@ static int do_getkey(const char *advertise_ip, const char *device_name,
         fprintf(stderr, "Fake scanner MAC %02x:%02x:%02x:%02x:%02x:%02x\n",
                 fake_mac[0], fake_mac[1], fake_mac[2],
                 fake_mac[3], fake_mac[4], fake_mac[5]);
+        fprintf(stderr, "Fake scanner UDP info tail %02x%02x%02x%02x%02x%02x%02x%02x\n",
+                info_tail[0], info_tail[1], info_tail[2], info_tail[3],
+                info_tail[4], info_tail[5], info_tail[6], info_tail[7]);
         fprintf(stderr, "Listening on UDP 52217, TCP 53219, TCP 53218\n");
         fprintf(stderr, "Broadcasting discovery on UDP 53220\n");
     }
@@ -1032,6 +1053,7 @@ static int do_getkey(const char *advertise_ip, const char *device_name,
                       device_name ? device_name : "iX500-A0PB023744");
     copy_padded_ascii(reg_resp + 104, 16,
                       model_name ? model_name : "ScanSnap iX500  ");
+    memcpy(reg_resp + 124, info_tail, sizeof(info_tail));
 
     struct sockaddr_in bcast_dst = {
         .sin_family = AF_INET, .sin_port = htons(53220),
@@ -1177,7 +1199,9 @@ static void usage(void) {
         "  --getkey-model MODEL\n"
         "           fake scanner model string (default: ScanSnap iX500)\n"
         "  --getkey-mac MAC\n"
-        "           fake scanner MAC (default: 00:80:92:58:c1:5c)\n");
+        "           fake scanner MAC (default: 00:80:92:58:c1:5c)\n"
+        "  --getkey-tail HEX\n"
+        "           8-byte hex tail for UDP device info response\n");
 }
 
 int main(int argc, char *argv[]) {
@@ -1192,6 +1216,7 @@ int main(int argc, char *argv[]) {
     const char *getkey_name = NULL;
     const char *getkey_model = NULL;
     const char *getkey_mac = NULL;
+    const char *getkey_tail = NULL;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--getkey") == 0) {
             want_getkey = true;
@@ -1229,10 +1254,19 @@ int main(int argc, char *argv[]) {
             getkey_mac = argv[++i];
         } else if (strncmp(argv[i], "--getkey-mac=", 13) == 0) {
             getkey_mac = argv[i] + 13;
+        } else if (strcmp(argv[i], "--getkey-tail") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "Error: --getkey-tail requires a value\n");
+                return 1;
+            }
+            getkey_tail = argv[++i];
+        } else if (strncmp(argv[i], "--getkey-tail=", 14) == 0) {
+            getkey_tail = argv[i] + 14;
         }
     }
     if (want_getkey) {
-        return do_getkey(getkey_ip, getkey_name, getkey_model, getkey_mac) < 0 ? 1 : 0;
+        return do_getkey(getkey_ip, getkey_name, getkey_model,
+                         getkey_mac, getkey_tail) < 0 ? 1 : 0;
     }
 
     const char *scanner_str = NULL, *output = NULL, *key_str = NULL;
