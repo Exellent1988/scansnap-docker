@@ -91,6 +91,15 @@ DOCKER COMPOSE WORKFLOW
             it in debug mode and force the advertised host IP:
 
                 docker compose run --rm scansnap -d --getkey --getkey-ip HOST_LAN_IP
+          - If ScanSnap Home keeps sending UDP registrations but never
+            opens TCP 53219, match the fake scanner identity more
+            closely to the real device:
+
+                docker compose run --rm scansnap \
+                  -d --getkey \
+                  --getkey-ip HOST_LAN_IP \
+                  --getkey-name 'iX500-XXXXXXXXXX' \
+                  --getkey-model 'ScanSnap iX500'
 
 
 SETUP (one time)
@@ -128,6 +137,12 @@ OPTIONS
      --getkey    capture pairing key (see setup)
      --getkey-ip IP
                  advertise this host IP in fake scanner mode
+     --getkey-name NAME
+                 fake scanner device name for `--getkey`
+     --getkey-model MODEL
+                 fake scanner model string for `--getkey`
+     --getkey-mac MAC
+                 fake scanner MAC for `--getkey`
 
 
 HOW IT WORKS
