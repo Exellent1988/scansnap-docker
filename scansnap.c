@@ -13,6 +13,8 @@
  *   -d          debug output
  *   -h          help
  *   --getkey    capture pairing key from ScanSnap Home
+ *   --getkey-ip IP
+ *               advertise this host IP in fake scanner mode
  */
 
 #include <arpa/inet.h>
@@ -900,7 +902,7 @@ static void cleanup_on_exit(void) {
 
 /* ── Get pairing key (fake scanner mode) ─────────────────────────────── */
 
-static int do_getkey(void) {
+static int do_getkey(const char *advertise_ip) {
     /* Broadcast discovery on UDP:53220 so ScanSnap Home finds us */
     int bcast_fd = socket(AF_INET, SOCK_DGRAM, 0);
     if (bcast_fd < 0) { perror("socket"); return -1; }
@@ -908,16 +910,32 @@ static int do_getkey(void) {
     setsockopt(bcast_fd, SOL_SOCKET, SO_BROADCAST, &opt, sizeof(opt));
     setsockopt(bcast_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 
-    /* Get our local IP */
-    int probe = socket(AF_INET, SOCK_DGRAM, 0);
-    struct sockaddr_in pdst = { .sin_family = AF_INET, .sin_port = htons(1) };
-    inet_pton(AF_INET, "8.8.8.8", &pdst.sin_addr);
-    connect(probe, (struct sockaddr *)&pdst, sizeof(pdst));
-    struct sockaddr_in plocal;
-    socklen_t pslen = sizeof(plocal);
-    getsockname(probe, (struct sockaddr *)&plocal, &pslen);
-    close(probe);
+    /* Get or override our local IP */
+    struct sockaddr_in plocal = { .sin_family = AF_INET };
+    if (advertise_ip && advertise_ip[0]) {
+        if (inet_pton(AF_INET, advertise_ip, &plocal.sin_addr) != 1) {
+            fprintf(stderr, "Error: invalid --getkey-ip address: %s\n", advertise_ip);
+            close(bcast_fd);
+            return -1;
+        }
+    } else {
+        int probe = socket(AF_INET, SOCK_DGRAM, 0);
+        if (probe < 0) { close(bcast_fd); return -1; }
+        struct sockaddr_in pdst = { .sin_family = AF_INET, .sin_port = htons(1) };
+        inet_pton(AF_INET, "8.8.8.8", &pdst.sin_addr);
+        connect(probe, (struct sockaddr *)&pdst, sizeof(pdst));
+        socklen_t pslen = sizeof(plocal);
+        getsockname(probe, (struct sockaddr *)&plocal, &pslen);
+        close(probe);
+    }
     uint8_t *ip = (uint8_t *)&plocal.sin_addr.s_addr;
+    if (g_debug) {
+        char ip_str[INET_ADDRSTRLEN];
+        inet_ntop(AF_INET, &plocal.sin_addr, ip_str, sizeof(ip_str));
+        fprintf(stderr, "Fake scanner advertising IP %s\n", ip_str);
+        fprintf(stderr, "Listening on UDP 52217, TCP 53219, TCP 53218\n");
+        fprintf(stderr, "Broadcasting discovery on UDP 53220\n");
+    }
 
     /* Listen on UDP:52217 for registration */
     int reg_fd = bind_udp(52217);
@@ -1002,8 +1020,9 @@ static int do_getkey(void) {
         /* Broadcast every 2 seconds */
         time_t now = time(NULL);
         if (now - last_bcast >= 2) {
-            sendto(bcast_fd, disc, 48, 0,
-                   (struct sockaddr *)&bcast_dst, sizeof(bcast_dst));
+            ssize_t sent = sendto(bcast_fd, disc, 48, 0,
+                                  (struct sockaddr *)&bcast_dst, sizeof(bcast_dst));
+            if (g_debug && sent < 0) perror("broadcast 53220");
             last_bcast = now;
         }
 
@@ -1018,6 +1037,9 @@ static int do_getkey(void) {
             ssize_t n = recvfrom(reg_fd, buf, sizeof(buf), 0,
                                  (struct sockaddr *)&from, &flen);
             if (n > 0) {
+                if (g_debug)
+                    fprintf(stderr, "UDP registration from %s (%zd bytes)\n",
+                            inet_ntoa(from.sin_addr), n);
                 sendto(reg_fd, reg_resp, 132, 0,
                        (struct sockaddr *)&from, flen);
             }
@@ -1029,6 +1051,8 @@ static int do_getkey(void) {
             socklen_t clen = sizeof(client);
             int conn = accept(tcp_fd, (struct sockaddr *)&client, &clen);
             if (conn < 0) continue;
+            if (g_debug)
+                fprintf(stderr, "TCP 53219 from %s\n", inet_ntoa(client.sin_addr));
             set_timeout(conn, 5);
 
             /* Send 16-byte hello */
@@ -1059,12 +1083,14 @@ static int do_getkey(void) {
                     memcpy(resp + 4, "VENS", 4);
                     write_all(conn, resp, 20);
                 } else if (cmd == 0x13) {
+                    if (g_debug) fprintf(stderr, "Handshake command 0x13\n");
                     uint8_t resp[112] = {0};
                     put_be32(resp, 112);
                     memcpy(resp + 4, "VENS", 4);
                     memcpy(resp + 16, "iX500-A0PB023744", 16);
                     write_all(conn, resp, 112);
                 } else if (cmd == 0x30) {
+                    if (g_debug) fprintf(stderr, "Handshake command 0x30\n");
                     uint8_t resp[32] = {0};
                     put_be32(resp, 32);
                     memcpy(resp + 4, "VENS", 4);
@@ -1078,6 +1104,7 @@ static int do_getkey(void) {
         if (fds[2].revents & POLLIN) {
             int conn = accept(scan_fd, NULL, NULL);
             if (conn >= 0) {
+                if (g_debug) fprintf(stderr, "TCP 53218 probe accepted\n");
                 uint8_t hello[16] = {0};
                 put_be32(hello, 16);
                 memcpy(hello + 4, "VENS", 4);
@@ -1104,7 +1131,9 @@ static void usage(void) {
         "  -1       single-sided (discard back pages)\n"
         "  -d       debug output\n"
         "  -h       help\n"
-        "  --getkey capture pairing key from ScanSnap Home\n");
+        "  --getkey capture pairing key from ScanSnap Home\n"
+        "  --getkey-ip IP\n"
+        "           advertise this host IP in fake scanner mode\n");
 }
 
 int main(int argc, char *argv[]) {
@@ -1113,10 +1142,26 @@ int main(int argc, char *argv[]) {
     signal(SIGTERM, on_signal);
     atexit(cleanup_on_exit);
 
-    /* Check for --getkey before getopt */
+    /* Check for --getkey before getopt so it can run standalone */
+    bool want_getkey = false;
+    const char *getkey_ip = NULL;
     for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "--getkey") == 0)
-            return do_getkey() < 0 ? 1 : 0;
+        if (strcmp(argv[i], "--getkey") == 0) {
+            want_getkey = true;
+        } else if (strcmp(argv[i], "-d") == 0) {
+            g_debug = true;
+        } else if (strcmp(argv[i], "--getkey-ip") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "Error: --getkey-ip requires an IP address\n");
+                return 1;
+            }
+            getkey_ip = argv[++i];
+        } else if (strncmp(argv[i], "--getkey-ip=", 12) == 0) {
+            getkey_ip = argv[i] + 12;
+        }
+    }
+    if (want_getkey) {
+        return do_getkey(getkey_ip) < 0 ? 1 : 0;
     }
 
     const char *scanner_str = NULL, *output = NULL, *key_str = NULL;

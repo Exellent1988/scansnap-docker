@@ -87,6 +87,10 @@ DOCKER COMPOSE WORKFLOW
           - For custom output names, append normal CLI flags:
 
                 docker compose run --rm scansnap -s SCANNER_IP -o /work/my_scan.pdf
+          - If `--getkey` sees no traffic on a multi-homed host, run
+            it in debug mode and force the advertised host IP:
+
+                docker compose run --rm scansnap -d --getkey --getkey-ip HOST_LAN_IP
 
 
 SETUP (one time)
@@ -122,6 +126,8 @@ OPTIONS
      -1          single-sided (discard back pages)
      -d          debug output
      --getkey    capture pairing key (see setup)
+     --getkey-ip IP
+                 advertise this host IP in fake scanner mode
 
 
 HOW IT WORKS
