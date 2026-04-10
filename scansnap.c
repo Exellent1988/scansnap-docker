@@ -1003,14 +1003,15 @@ static int do_getkey(const char *advertise_ip, const char *device_name,
         }
     }
 
-    /* Build discovery broadcast packet (48 bytes) */
+    /* Build discovery broadcast packet (48 bytes).
+     * Real scanner packets place 0x01 at byte 16 and the IP at byte 20. */
     uint8_t disc[48] = {0};
     put_be32(disc, 48);
     memcpy(disc + 4, "VENS", 4);
     put_be32(disc + 8, 0x21);
-    put_be32(disc + 16, 1);
-    memcpy(disc + 24, ip, 4);
-    memcpy(disc + 28, fake_mac, 6);
+    disc[16] = 1;
+    memcpy(disc + 20, ip, 4);
+    memcpy(disc + 24, fake_mac, 6);
 
     /* Real scanner registration response (132 bytes) */
     uint8_t reg_resp[132];
@@ -1027,9 +1028,9 @@ static int do_getkey(const char *advertise_ip, const char *device_name,
         reg_resp, sizeof(reg_resp));
     memcpy(reg_resp + 16, ip, 4);  /* our IP */
     memcpy(reg_resp + 28, fake_mac, 6);
-    copy_padded_ascii(reg_resp + 38, 16,
+    copy_padded_ascii(reg_resp + 40, 16,
                       device_name ? device_name : "iX500-A0PB023744");
-    copy_padded_ascii(reg_resp + 102, 16,
+    copy_padded_ascii(reg_resp + 104, 16,
                       model_name ? model_name : "ScanSnap iX500  ");
 
     struct sockaddr_in bcast_dst = {
