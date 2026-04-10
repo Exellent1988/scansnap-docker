@@ -455,7 +455,10 @@ static void send_d6_release(uint32_t scanner_ip, const uint8_t mac[6]) {
 static int do_register(uint32_t scanner_ip, uint32_t local_ip, const uint8_t mac[6]) {
     if (g_debug) fprintf(stderr, "UDP registration...\n");
     int fd = bind_udp(55264);
-    if (fd < 0) return -1;
+    if (fd < 0) {
+        if (g_debug) perror("  bind 55264");
+        return -1;
+    }
     set_timeout(fd, 3);
 
     uint8_t ip_bytes[4];
@@ -475,17 +478,28 @@ static int do_register(uint32_t scanner_ip, uint32_t local_ip, const uint8_t mac
             pkt[22] = 0xd7; pkt[23] = 0xe0;
             pkt[24] = (flags[m] >> 8) & 0xff;
             pkt[25] = flags[m] & 0xff;
-            sendto(fd, pkt, 32, 0, (struct sockaddr *)&dest, sizeof(dest));
+            if (sendto(fd, pkt, 32, 0, (struct sockaddr *)&dest, sizeof(dest)) < 0) {
+                if (g_debug) perror("  sendto 52217");
+                close(fd);
+                return -1;
+            }
         }
     }
 
     uint8_t buf[256];
-    ssize_t n = recvfrom(fd, buf, sizeof(buf), 0, NULL, NULL);
+    struct sockaddr_in from;
+    socklen_t from_len = sizeof(from);
+    ssize_t n = recvfrom(fd, buf, sizeof(buf), 0, (struct sockaddr *)&from, &from_len);
     if (g_debug) {
-        if (n > 0) fprintf(stderr, "  registration OK (%zd bytes)\n", n);
-        else fprintf(stderr, "  no registration response\n");
+        if (n > 0) {
+            fprintf(stderr, "  registration OK (%zd bytes from %s)\n",
+                    n, inet_ntoa(from.sin_addr));
+        } else {
+            perror("  recvfrom 52217");
+        }
     }
     close(fd);
+    if (n <= 0) return -1;
     usleep(500000);
     return 0;
 }
