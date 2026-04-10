@@ -99,7 +99,9 @@ DOCKER COMPOSE WORKFLOW
                   -d --getkey \
                   --getkey-ip HOST_LAN_IP \
                   --getkey-name 'iX500-XXXXXXXXXX' \
-                  --getkey-model 'ScanSnap iX500'
+                  --getkey-model 'ScanSnap iX500' \
+                  --getkey-mac '84:25:3f:07:c5:7e' \
+                  --getkey-tail '369c5a7212800000'
 
 
 SETUP (one time)
@@ -143,6 +145,8 @@ OPTIONS
                  fake scanner model string for `--getkey`
      --getkey-mac MAC
                  fake scanner MAC for `--getkey`
+     --getkey-tail HEX
+                 8-byte hex tail for the UDP device info response
 
 
 HOW IT WORKS
