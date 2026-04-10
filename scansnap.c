@@ -546,8 +546,9 @@ static int do_init_session(uint32_t scanner_ip, const uint8_t mac[6]) {
     uint8_t hello[16];
     if (read_exact(fd, hello, 16) < 0) { close(fd); return -1; }
 
-    bool t2_ok;
-    pthread_t t2 = start_handshake(scanner_ip, mac, 2, &t2_ok);
+    bool t2_ok = false;
+    pthread_t t2 = (pthread_t){0};
+    t2 = start_handshake(scanner_ip, mac, 2, &t2_ok);
 
     static const char *cmds[] = {
         "0000000600000060000000000000000012000000600000000000000000000000",
@@ -561,7 +562,7 @@ static int do_init_session(uint32_t scanner_ip, const uint8_t mac[6]) {
     static const char *labels[] = { "06+12", "E7", "C2", "E6a", "E6b", "D5", "D6" };
 
     bool t3_ok = false;
-    pthread_t t3;
+    pthread_t t3 = (pthread_t){0};
     for (int i = 0; i < 7; i++) {
         if (g_interrupted) { close(fd); return -1; }
         uint8_t pkt[512];

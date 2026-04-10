@@ -12,6 +12,35 @@ BUILD
 
           make
 
+DOCKER
+
+          Build:
+
+              docker build -t scansnap .
+
+          Show help:
+
+              docker run --rm scansnap
+
+          Scan to the current directory using a saved key:
+
+              docker run --rm \
+                -v "$PWD:/work" \
+                -v "$HOME/.config:/config" \
+                scansnap -s SCANNER_IP
+
+          Notes:
+
+          - The container includes the `ip` command because the tool
+            uses `ip route get` internally to pick the correct
+            interface.
+          - Auto-discovery works best with host networking. On Linux,
+            use `--network host`. On Docker Desktop, passing `-s IP`
+            is usually the safer option.
+          - `--getkey` needs the ScanSnap Home app to reach the fake
+            scanner ports. That generally means `--network host`, or
+            equivalent host-network support in your Docker runtime.
+
 
 SETUP (one time)
 
