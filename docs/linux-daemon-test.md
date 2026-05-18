@@ -4,7 +4,7 @@
 
 ## Voraussetzungen
 
-- Linux-Host mit `gcc`, `make`, `libpthread` (meist vorinstalliert)
+- Linux-Host mit Docker (für den Container-Betrieb) **oder** `gcc`, `make`, `libpthread` (für nativen Build)
 - Scanner und Linux-Rechner im gleichen Netzwerk (oder über Router erreichbar)
 - ScanSnap Home beenden (falls vorhanden)
 - Root/sudo für `tcpdump` falls Diagnose nötig
@@ -73,7 +73,7 @@ sudo sysctl -w net.ipv4.conf.default.rp_filter=0
 ./scansnap -d --daemon -s 192.168.2.117 -k 175132178180 -o ./output
 ```
 
-Erwartetes Init-Log:
+Erwartetes Init-Log (Scanner **ein**):
 
 ```
 MAC=xx:xx:xx:xx:xx:xx  IP=192.168.x.x
@@ -85,6 +85,21 @@ TCP:53218 init session...
   06+12: 136B  E7: 52B  C2: 72B  E6a: 44B  E6b: 40B  D5: 48B  D6: 40B
 Daemon ready on UDP 55265 (output: ./output). Press scanner button or Ctrl+C to exit.
 ```
+
+Wenn der Scanner beim Start **ausgeschaltet oder im Standby** ist, wartet der Daemon automatisch:
+
+```
+MAC=xx:xx:xx:xx:xx:xx  IP=192.168.x.x
+UDP registration...
+  recvfrom 52217: Resource temporarily unavailable
+Scanner not reachable, retrying in 20s...
+...
+  registration OK (132 bytes from 192.168.2.117)
+...
+Daemon ready on UDP 55265 (output: ./output). Press scanner button or Ctrl+C to exit.
+```
+
+Gleiches gilt wenn der Scanner nach einem Scan in den Standby geht — der Daemon erholt sich selbst, **kein Neustart nötig**.
 
 ## Schritt 5 — Button drücken und Ergebnis prüfen
 
@@ -108,22 +123,27 @@ Zeigt `tcpdump` keine Pakete → Scanner schickt keine Events (Registrierung feh
 
 ## Schritt 6 — Docker-Test
 
-Nach erfolgreichem Nativ-Test mit Docker:
+Der Container kompiliert den Daemon selbst (Multi-stage Build), d.h. kein lokales `gcc` nötig.
 
 ```bash
-# output-Verzeichnis anlegen
-mkdir -p output
+# output- und config-Verzeichnis anlegen
+mkdir -p output config
 
 # Docker-Image bauen
-docker compose build
+docker build -t scansnap:local .
 
-# Daemon im Container starten (network_mode: host nötig!)
-docker compose run --rm scansnap \
-  --daemon -s 192.168.2.117 -k 175132178180 -o /output
+# Daemon im Container starten (--network host nötig für UDP!)
+docker run --rm \
+  --network host \
+  -v ./output:/work \
+  -v ./config:/config \
+  scansnap:local \
+  --daemon -s 192.168.2.117 -k 175132178180 -o /work
 ```
 
-`compose.yml` verwendet bereits `network_mode: host`, damit UDP-Ports direkt
-vom Container erreichbar sind — kein Port-Forwarding erforderlich.
+`--network host` ist zwingend, damit der Container UDP-Port 55265 direkt vom Scanner empfangen kann — kein Port-Forwarding möglich/nötig.
+
+> **Hinweis für Unraid:** `docker compose` steht standardmäßig nicht zur Verfügung, daher die obigen `docker build` / `docker run`-Befehle verwenden.
 
 ## Bekannte Stolpersteine
 
@@ -132,8 +152,8 @@ vom Container erreichbar sind — kein Port-Forwarding erforderlich.
 | `bind 55265: Address already in use` | Anderer Prozess belegt Port | `ss -ulnp \| grep 55265`, dann `kill <pid>` |
 | `registration OK` aber keine Button-Events | macOS RPF oder falsches Interface | `tcpdump` — kommen Pakete auf 55265 an? |
 | `Scan failed: no image data` | Kein Papier eingelegt | Papier in ADF legen |
-| `Scan failed: TCP handshake` | Scanner Power-Cycle nötig | Scanner neu starten, Daemon neu starten |
-| Daemon startet nach Scan nicht mehr | Scanner sendet Events nicht neu | `daemon_prepare_session` neu → Scanner-Neustart |
+| `Scan failed: TCP handshake` | Scanner braucht Power-Cycle | Scanner neu starten — Daemon erholt sich automatisch |
+| `Scanner not reachable, retrying in 20s...` | Scanner aus oder im Standby beim Start | Normal — Daemon wartet selbst, kein Eingriff nötig |
 
 ## Erster Scan ohne Daemon (Funktionstest)
 

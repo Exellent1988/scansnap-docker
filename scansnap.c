@@ -55,10 +55,11 @@
 
 #include "button_notify.h"
 
-#define MAX_PAGES    256
+#define MAX_PAGES      256
 #define DAEMON_POLL_MS 25000
-#define RECV_BUF     65536
-#define MAX_PAYLOAD  (16 * 1024 * 1024)
+#define DAEMON_RETRY_S 20
+#define RECV_BUF       65536
+#define MAX_PAYLOAD    (16 * 1024 * 1024)
 
 static bool g_debug = false;
 static volatile sig_atomic_t g_interrupted = 0;
@@ -1211,6 +1212,26 @@ static int daemon_prepare_session(uint32_t scanner_ip, uint32_t local_ip, const 
     return 0;
 }
 
+/* Retries daemon_prepare_session() until the scanner responds or the process
+ * is interrupted. Returns 0 when the session is ready, -1 if interrupted. */
+static int daemon_wait_for_scanner(uint32_t scanner_ip, uint32_t local_ip, const uint8_t mac[6]) {
+    static bool first_attempt = true;
+    for (;;) {
+        if (g_interrupted)
+            return -1;
+        if (daemon_prepare_session(scanner_ip, local_ip, mac) == 0) {
+            if (!first_attempt)
+                fprintf(stderr, "Scanner back online, daemon ready.\n");
+            first_attempt = false;
+            return 0;
+        }
+        first_attempt = false;
+        fprintf(stderr, "Scanner not reachable, retrying in %ds...\n", DAEMON_RETRY_S);
+        for (int i = 0; i < DAEMON_RETRY_S && !g_interrupted; i++)
+            sleep(1);
+    }
+}
+
 
 static uint32_t daemon_drain_notify_baseline(int udp_fd, uint32_t scanner_ip) {
     uint32_t baseline = 0;
@@ -1319,8 +1340,8 @@ static int do_daemon(uint32_t scanner_ip, uint32_t local_ip, const uint8_t mac[6
     g_bind_ip = local_ip;
     memcpy(g_mac, mac, 6);
 
-    if (daemon_prepare_session(scanner_ip, local_ip, mac) < 0)
-        return -1;
+    if (daemon_wait_for_scanner(scanner_ip, local_ip, mac) < 0)
+        return 0;
 
     int udp_fd = bind_udp_any(BUTTON_CALLBACK_PORT);
     if (udp_fd < 0) {
@@ -1383,10 +1404,8 @@ static int do_daemon(uint32_t scanner_ip, uint32_t local_ip, const uint8_t mac[6
             fprintf(stderr, "Scan failed\n");
         if (g_interrupted)
             break;
-        if (daemon_prepare_session(scanner_ip, local_ip, mac) < 0) {
-            fprintf(stderr, "Error: failed to restore scanner session\n");
+        if (daemon_wait_for_scanner(scanner_ip, local_ip, mac) < 0)
             break;
-        }
         last_counter = daemon_drain_notify_baseline(udp_fd, scanner_ip);
     }
 
