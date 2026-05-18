@@ -1162,7 +1162,7 @@ static int save_pdf(const struct page *pages, int count, const char *path) {
 
     free(off);
     fclose(f);
-    chmod(path, 0600);
+    chmod(path, 0644);
     return 0;
 }
 
@@ -1232,6 +1232,14 @@ static int daemon_wait_for_scanner(uint32_t scanner_ip, uint32_t local_ip, const
     }
 }
 
+
+/* Discard all pending UDP packets on the socket — used after a scanner
+ * reconnect to flush stale pre-power-cycle notifications. */
+static void daemon_flush_udp(int udp_fd) {
+    uint8_t buf[256];
+    while (recvfrom(udp_fd, buf, sizeof(buf), MSG_DONTWAIT, NULL, NULL) > 0)
+        ;
+}
 
 static uint32_t daemon_drain_notify_baseline(int udp_fd, uint32_t scanner_ip) {
     uint32_t baseline = 0;
@@ -1406,6 +1414,9 @@ static int do_daemon(uint32_t scanner_ip, uint32_t local_ip, const uint8_t mac[6
             break;
         if (daemon_wait_for_scanner(scanner_ip, local_ip, mac) < 0)
             break;
+        /* Flush stale pre-reconnect UDP packets so a post-power-cycle
+         * counter reset (e.g. 10 → 2) doesn't block future button events. */
+        daemon_flush_udp(udp_fd);
         last_counter = daemon_drain_notify_baseline(udp_fd, scanner_ip);
     }
 
@@ -1718,6 +1729,7 @@ static void usage(void) {
 }
 
 int main(int argc, char *argv[]) {
+    umask(0022); /* ensure output files are created as 644, not 600 */
     signal(SIGPIPE, SIG_IGN);
     signal(SIGINT, on_signal);
     signal(SIGTERM, on_signal);
@@ -1959,7 +1971,7 @@ int main(int argc, char *argv[]) {
         for (int i = 0; i < out_n; i++) {
             char path[256];
             snprintf(path, sizeof(path), out_n > 1 ? "%s_p%d.jpg" : "%s.jpg", output, i + 1);
-            int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+            int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
             if (fd < 0) { perror(path); rc = 1; break; }
             if (write_all(fd, out[i].data, out[i].len) < 0) {
                 fprintf(stderr, "Error: failed to write %s\n", path);
