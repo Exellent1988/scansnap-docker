@@ -75,6 +75,10 @@ DOCKER COMPOSE WORKFLOW
      key, you can skip the bootstrap step and either put it in
      `./config/scansnap/key` or pass `-k KEY` manually.
 
+          Stop ScanSnap Home before regular scans. Its background
+     helpers keep registering with the scanner and can hold the device
+     in a busy session state, which shows up as handshake error -4.
+
           Important:
 
           - The compose file uses `network_mode: host` because the
@@ -102,6 +106,16 @@ DOCKER COMPOSE WORKFLOW
                   --getkey-model 'ScanSnap iX500' \
                   --getkey-mac 'SCANNER_MAC_REDACTED' \
                   --getkey-tail 'DEVICE_INFO_TAIL_REDACTED'
+          - For firmware-specific debugging, dump the live TCP `0x11`
+            handshake request/response and patch individual bytes:
+
+                ./scansnap -d -s SCANNER_IP -k KEY \
+                  --dump-handshake handshake.log \
+                  --handshake-patch 108:DEVICE_INFO_TAIL_REDACTED
+
+          - Compare the first TCP `0x11` request across captures:
+
+                python3 scripts/compare_handshakes.py try-to-get-key.pcapng try-to-get-key4.pcapng
 
 
 SETUP (one time)
@@ -127,6 +141,16 @@ SCAN
           The scanner is found automatically on your local network.
      Pages come out as a timestamped PDF in the current directory.
 
+          If ScanSnap Home is installed on the same machine, quit it
+     completely before scanning. On macOS the menu bar app leaves helper
+     processes running; stop them before using this tool:
+
+          pkill -f '/Applications/ScanSnapHomeMain.app'
+
+          Error -4 means the scanner still has a busy/stale session.
+     Turn the scanner off and on, make sure ScanSnap Home is not
+     running, then retry.
+
 
 OPTIONS
 
@@ -147,6 +171,14 @@ OPTIONS
                  fake scanner MAC for `--getkey`
      --getkey-tail HEX
                  8-byte hex tail for the UDP device info response
+     --client-ip IP
+                 override local client IP for scanner communication
+     --client-mac MAC
+                 override client MAC for scanner communication
+     --dump-handshake FILE
+                 append TCP 0x11 request/response hex to FILE
+     --handshake-patch OFFSET:HEX
+                 patch bytes in the TCP 0x11 request before sending
 
 
 HOW IT WORKS
