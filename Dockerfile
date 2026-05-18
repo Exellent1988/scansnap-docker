@@ -5,7 +5,7 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /src
-COPY Makefile scansnap.c ./
+COPY Makefile scansnap.c button_notify.c button_notify.h ./
 RUN make
 
 FROM debian:bookworm-slim

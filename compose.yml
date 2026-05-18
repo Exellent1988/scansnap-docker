@@ -10,4 +10,6 @@ services:
       - ./output:/work
       - ./config:/config
     network_mode: host
+    # Example daemon (set scanner IP):
+    # command: ["--daemon", "-s", "192.168.2.117", "-o", "/work", "-d"]
     command: ["-h"]

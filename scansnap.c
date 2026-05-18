@@ -12,6 +12,7 @@
  *   -1          single-sided (discard back pages)
  *   -d          debug output
  *   -h          help
+ *   --daemon    wait for scanner button, write PDFs to -o directory
  *   --getkey    capture pairing key from ScanSnap Home
  *   --getkey-ip IP
  *               advertise this host IP in fake scanner mode
@@ -52,7 +53,10 @@
 #include <poll.h>
 #include <unistd.h>
 
+#include "button_notify.h"
+
 #define MAX_PAGES    256
+#define DAEMON_POLL_MS 25000
 #define RECV_BUF     65536
 #define MAX_PAYLOAD  (16 * 1024 * 1024)
 
@@ -349,6 +353,21 @@ static int bind_udp(uint16_t port) {
     setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
     struct sockaddr_in addr = { .sin_family = AF_INET, .sin_port = htons(port) };
     if (g_bind_ip != 0) addr.sin_addr.s_addr = g_bind_ip;
+    if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) { close(fd); return -1; }
+    return fd;
+}
+
+/* Callback port must accept unicast to any local address (scanner uses handshake IP). */
+static int bind_udp_any(uint16_t port) {
+    int fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (fd < 0) return -1;
+    int opt = 1;
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    struct sockaddr_in addr = {
+        .sin_family = AF_INET,
+        .sin_addr.s_addr = htonl(INADDR_ANY),
+        .sin_port = htons(port),
+    };
     if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) { close(fd); return -1; }
     return fd;
 }
@@ -826,6 +845,12 @@ static int do_init_session(uint32_t scanner_ip, const uint8_t mac[6]) {
     return 0;
 }
 
+/*
+ * Open a 53218 session and return the open fd — the caller must keep it open
+ * (periodically polling C2) to receive button-notify UDP callbacks from the scanner.
+ * Returns fd >= 0 on success, -1 on failure.
+ */
+
 static int do_re_register(uint32_t scanner_ip, uint32_t local_ip, const uint8_t mac[6]) {
     int fd = bind_udp(55264);
     if (fd < 0) return -1;
@@ -842,7 +867,8 @@ static int do_re_register(uint32_t scanner_ip, uint32_t local_ip, const uint8_t 
         memcpy(pkt + 8, ip_bytes, 4);
         memcpy(pkt + 12, mac, 6);
         pkt[22] = 0xd7; pkt[23] = 0xe0;
-        pkt[24] = 0x10; pkt[25] = 0x00;
+        /* Flag 0x0100 (big-endian) matches ScanSnap Home re-registration as seen in PCAPs. */
+        pkt[24] = 0x01; pkt[25] = 0x00;
         sendto(fd, pkt, 32, 0, (struct sockaddr *)&dest, sizeof(dest));
         uint8_t buf[256];
         recvfrom(fd, buf, sizeof(buf), 0, NULL, NULL);
@@ -1148,6 +1174,228 @@ static void cleanup_on_exit(void) {
         send_d6_release(g_scanner_ip, g_mac);
 }
 
+/* ── Button daemon ───────────────────────────────────────────────────── */
+
+static int ensure_output_dir(const char *dir) {
+    struct stat st;
+    if (stat(dir, &st) == 0)
+        return S_ISDIR(st.st_mode) ? 0 : -1;
+    return mkdir(dir, 0755);
+}
+
+static int daemon_pdf_path(const char *dir, char *path, size_t path_len) {
+    char name[64];
+    time_t now = time(NULL);
+    struct tm *tm = localtime(&now);
+    if (!tm)
+        return -1;
+    strftime(name, sizeof(name), "scan_%Y%m%d_%H%M%S", tm);
+    size_t dlen = strlen(dir);
+    bool slash = dlen > 0 && dir[dlen - 1] == '/';
+    int n = slash
+        ? snprintf(path, path_len, "%s%s.pdf", dir, name)
+        : snprintf(path, path_len, "%s/%s.pdf", dir, name);
+    return (n > 0 && (size_t)n < path_len) ? 0 : -1;
+}
+
+/*
+ * Full registration + TCP init + D6 release.  Puts the scanner back into idle
+ * mode so it starts emitting button-notify UDP packets.  Returns 0 on success.
+ */
+static int daemon_prepare_session(uint32_t scanner_ip, uint32_t local_ip, const uint8_t mac[6]) {
+    if (do_register(scanner_ip, local_ip, mac) < 0
+        || do_handshake_conn1(scanner_ip, local_ip, mac) < 0
+        || do_init_session(scanner_ip, mac) < 0)
+        return -1;
+    do_re_register(scanner_ip, local_ip, mac);
+    return 0;
+}
+
+
+static uint32_t daemon_drain_notify_baseline(int udp_fd, uint32_t scanner_ip) {
+    uint32_t baseline = 0;
+    for (;;) {
+        uint8_t buf[256];
+        struct sockaddr_in from;
+        socklen_t from_len = sizeof(from);
+        ssize_t n = recvfrom(udp_fd, buf, sizeof(buf), MSG_DONTWAIT,
+                             (struct sockaddr *)&from, &from_len);
+        if (n < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK)
+                break;
+            perror("recvfrom baseline");
+            break;
+        }
+        if (n == 0)
+            break;
+        if (from.sin_addr.s_addr != scanner_ip)
+            continue;
+        if (!button_notify_valid(buf, (size_t)n))
+            continue;
+        uint32_t c = button_notify_counter(buf, (size_t)n);
+        if (c > baseline)
+            baseline = c;
+    }
+    if (baseline > 0)
+        fprintf(stderr, "Notify baseline counter %u (press button to scan)\n", baseline);
+    return baseline;
+}
+
+static int daemon_run_scan(uint32_t scanner_ip, uint32_t local_ip, const uint8_t mac[6],
+                           const char *out_dir, bool simplex) {
+    fprintf(stderr, "Starting scan...\n");
+    if (do_register(scanner_ip, local_ip, mac) < 0) {
+        fprintf(stderr, "Scan failed: UDP registration\n");
+        return -1;
+    }
+    if (do_handshake_conn1(scanner_ip, local_ip, mac) < 0) {
+        fprintf(stderr, "Scan failed: TCP handshake\n");
+        return -1;
+    }
+    if (do_init_session(scanner_ip, mac) < 0) {
+        fprintf(stderr, "Scan failed: init session\n");
+        return -1;
+    }
+    do_re_register(scanner_ip, local_ip, mac);
+
+    struct page pages[MAX_PAGES];
+    int total = 0;
+    uint32_t saved_scanner = g_scanner_ip;
+    int scan_rc = do_scan(scanner_ip, mac, pages, &total);
+    g_scanner_ip = saved_scanner;
+    if (scan_rc < 0) {
+        fprintf(stderr, "Scan failed: no image data (paper in ADF?)\n");
+        send_d6_release(scanner_ip, mac);
+        return -1;
+    }
+    if (total == 0) {
+        fprintf(stderr, "No pages scanned\n");
+        return -1;
+    }
+
+    struct page *out = pages;
+    int out_n = total;
+    struct page *simplex_buf = NULL;
+    if (simplex) {
+        simplex_buf = calloc((size_t)total, sizeof(struct page));
+        if (!simplex_buf) {
+            fprintf(stderr, "Error: out of memory\n");
+            for (int i = 0; i < total; i++) free(pages[i].data);
+            return -1;
+        }
+        out_n = 0;
+        for (int i = 0; i < total; i += 2)
+            simplex_buf[out_n++] = pages[i];
+        out = simplex_buf;
+    }
+
+    char path[512];
+    if (daemon_pdf_path(out_dir, path, sizeof(path)) < 0) {
+        fprintf(stderr, "Error: output path too long\n");
+        for (int i = 0; i < total; i++) free(pages[i].data);
+        free(simplex_buf);
+        return -1;
+    }
+
+    int rc = save_pdf(out, out_n, path);
+    if (rc < 0)
+        fprintf(stderr, "Error: failed to write %s\n", path);
+    else
+        fprintf(stderr, "Saved %s (%d pages)\n", path, out_n);
+
+    for (int i = 0; i < total; i++) free(pages[i].data);
+    free(simplex_buf);
+    return rc;
+}
+
+static int do_daemon(uint32_t scanner_ip, uint32_t local_ip, const uint8_t mac[6],
+                     const char *out_dir, bool simplex) {
+    if (ensure_output_dir(out_dir) < 0) {
+        fprintf(stderr, "Error: cannot use output directory: %s\n", out_dir);
+        return -1;
+    }
+
+    g_scanner_ip = scanner_ip;
+    g_bind_ip = local_ip;
+    memcpy(g_mac, mac, 6);
+
+    if (daemon_prepare_session(scanner_ip, local_ip, mac) < 0)
+        return -1;
+
+    int udp_fd = bind_udp_any(BUTTON_CALLBACK_PORT);
+    if (udp_fd < 0) {
+        perror("Error: bind UDP callback port");
+        return -1;
+    }
+
+    fprintf(stderr,
+            "Daemon ready on UDP %u (output: %s). Press scanner button or Ctrl+C to exit.\n",
+            (unsigned)BUTTON_CALLBACK_PORT, out_dir);
+    fprintf(stderr, "Stop ScanSnap Home before using the daemon.\n");
+    fprintf(stderr, "Restart the daemon after every scanner power-cycle.\n");
+
+    uint32_t last_counter = daemon_drain_notify_baseline(udp_fd, scanner_ip);
+    while (!g_interrupted) {
+        struct pollfd pfd = { .fd = udp_fd, .events = POLLIN };
+        int r = poll(&pfd, 1, DAEMON_POLL_MS);
+        if (r < 0) {
+            if (errno == EINTR)
+                continue;
+            perror("poll");
+            break;
+        }
+        if (r == 0) {
+            static int keepalive_count;
+            if (g_debug)
+                fprintf(stderr, "Keepalive (%d): re-register UDP...\n", ++keepalive_count);
+            do_re_register(scanner_ip, local_ip, mac);
+            continue;
+        }
+
+        uint8_t buf[256];
+        struct sockaddr_in from;
+        socklen_t from_len = sizeof(from);
+        ssize_t n = recvfrom(udp_fd, buf, sizeof(buf), 0,
+                             (struct sockaddr *)&from, &from_len);
+        if (n <= 0)
+            continue;
+        if (from.sin_addr.s_addr != scanner_ip)
+            continue;
+
+        fprintf(stderr, "UDP %zdB from scanner", n);
+        if (button_notify_valid(buf, (size_t)n))
+            fprintf(stderr, " (notify counter %u)", button_notify_counter(buf, (size_t)n));
+        fprintf(stderr, "\n");
+
+        if (!button_notify_valid(buf, (size_t)n))
+            continue;
+
+        uint32_t counter = button_notify_counter(buf, (size_t)n);
+        if (!button_notify_counter_is_new(last_counter, counter)) {
+            if (g_debug)
+                fprintf(stderr, "Ignored notify counter %u (last %u)\n", counter, last_counter);
+            continue;
+        }
+        last_counter = counter;
+
+        fprintf(stderr, "Button event (counter %u), scanning...\n", counter);
+        if (daemon_run_scan(scanner_ip, local_ip, mac, out_dir, simplex) < 0)
+            fprintf(stderr, "Scan failed\n");
+        if (g_interrupted)
+            break;
+        if (daemon_prepare_session(scanner_ip, local_ip, mac) < 0) {
+            fprintf(stderr, "Error: failed to restore scanner session\n");
+            break;
+        }
+        last_counter = daemon_drain_notify_baseline(udp_fd, scanner_ip);
+    }
+
+    close(udp_fd);
+    send_d6_release(scanner_ip, mac);
+    g_scanner_ip = 0;
+    return 0;
+}
+
 /* ── Get pairing key (fake scanner mode) ─────────────────────────────── */
 
 static void copy_padded_ascii(uint8_t *dst, size_t dst_len, const char *src) {
@@ -1428,6 +1676,7 @@ static void usage(void) {
         "  -1       single-sided (discard back pages)\n"
         "  -d       debug output\n"
         "  -h       help\n"
+        "  --daemon  wait for physical scanner button; -o is output directory\n"
         "  --getkey capture pairing key from ScanSnap Home\n"
         "  --getkey-ip IP\n"
         "           advertise this host IP in fake scanner mode\n"
@@ -1457,6 +1706,7 @@ int main(int argc, char *argv[]) {
 
     /* Check for --getkey before getopt so it can run standalone */
     bool want_getkey = false;
+    bool want_daemon = false;
     const char *getkey_ip = NULL;
     const char *getkey_name = NULL;
     const char *getkey_model = NULL;
@@ -1467,6 +1717,8 @@ int main(int argc, char *argv[]) {
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--getkey") == 0) {
             want_getkey = true;
+        } else if (strcmp(argv[i], "--daemon") == 0) {
+            want_daemon = true;
         } else if (strcmp(argv[i], "-d") == 0) {
             g_debug = true;
         } else if (strcmp(argv[i], "--getkey-ip") == 0) {
@@ -1558,7 +1810,7 @@ int main(int argc, char *argv[]) {
     for (int i = 1; i < argc; i++) {
         bool skip_current = false;
         bool skip_next = false;
-        if (strcmp(argv[i], "--getkey") == 0) {
+        if (strcmp(argv[i], "--getkey") == 0 || strcmp(argv[i], "--daemon") == 0) {
             skip_current = true;
         } else if (strcmp(argv[i], "--getkey-ip") == 0
                    || strcmp(argv[i], "--getkey-name") == 0
@@ -1606,6 +1858,11 @@ int main(int argc, char *argv[]) {
         }
     }
 
+    if (want_daemon && jpeg_mode) {
+        fprintf(stderr, "Error: --daemon does not support -j yet\n");
+        return 1;
+    }
+
     uint32_t scanner_ip;
     if (key_str)
         g_pairing_key = key_str;
@@ -1637,6 +1894,11 @@ int main(int argc, char *argv[]) {
         struct in_addr a = { .s_addr = local_ip };
         fprintf(stderr, "MAC=%02x:%02x:%02x:%02x:%02x:%02x IP=%s\n",
                 mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], inet_ntoa(a));
+    }
+
+    if (want_daemon) {
+        const char *out_dir = output ? output : ".";
+        return do_daemon(scanner_ip, local_ip, mac, out_dir, simplex) < 0 ? 1 : 0;
     }
 
     g_scanner_ip = scanner_ip;

@@ -53,6 +53,29 @@ PACKET FORMAT
        32+     var   Command payload (see SCAN SESSION)
 
 
+BUTTON CALLBACK NOTIFY (UDP TO CLIENT PORT 55265)
+
+          After TCP:53219 registration, the client advertises callback
+     port 0xd7e1 (55265) in the handshake packet. When the physical
+     scanner button is pressed, the scanner sends 48-byte UDP packets
+     to that port on the client (often three bursts ~0.5 s apart).
+
+          Format (observed on ScanSnap iX500):
+
+       Offset  Size  Field
+       ------  ----  -----
+       0       4     Length (0x00000030 = 48)
+       4       4     Magic "VENS"
+       8       4     0x00000001 (not 0x21 — see discovery below)
+       12      4     0x00000000
+       16      4     Event counter (little-endian; increments per press)
+       20      28    Zero padding
+
+          Broadcast discovery on UDP port 53220 uses 0x00000021 at
+     offset 8 instead. scansnap --daemon listens on 55265 for these
+     notifications and starts a scan when the counter increases.
+
+
 DISCOVERY (UDP PORT 53220)
 
           The scanner periodically broadcasts to
